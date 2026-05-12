@@ -21,13 +21,18 @@ import os
 import time
 import re
 
-# ========== DeepSeek 配置 ==========
-client = OpenAI(
-    api_key=os.getenv("DEEPSEEK_API_KEY"),
-    base_url="https://api.deepseek.com"
-)
-
 MODEL = "deepseek-chat"   # 也可用 deepseek-reasoner
+
+
+def _get_client():
+    api_key = os.getenv("DEEPSEEK_API_KEY")
+    if not api_key:
+        return None
+
+    return OpenAI(
+        api_key=api_key,
+        base_url="https://api.deepseek.com"
+    )
 
 
 def analyze_sentiment(news_text: str, max_retry: int = 2) -> dict:
@@ -49,6 +54,11 @@ def analyze_sentiment(news_text: str, max_retry: int = 2) -> dict:
 情绪: 利好/利空/中性
 评分: 整数（-100 到 100，利好为正，利空为负，中性接近0）
 原因: 一句话说明评分理由"""
+
+    client = _get_client()
+    if client is None:
+        print("[WARN] 未设置 DEEPSEEK_API_KEY，新闻情绪按中性处理")
+        return {"情绪": "中性", "评分": 0, "原因": "未配置AI情绪分析密钥"}
 
     for attempt in range(max_retry + 1):
         try:

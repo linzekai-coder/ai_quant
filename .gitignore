@@ -1,0 +1,16 @@
+venv/
+__pycache__/
+*.pyc
+
+.env
+*.log
+update_log.txt
+
+quant.db
+*.sqlite
+*.sqlite3
+
+report/output/
+backtest_result.png
+
+.streamlit/secrets.toml

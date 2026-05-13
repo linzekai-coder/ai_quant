@@ -18,6 +18,9 @@ from utils.logger import logger
 from utils.notify import send_message
 
 
+REAL_TRADING = False
+
+
 def generate_trade_signal(symbol, score, level):
     if score >= 80:
         action = "BUY"
@@ -130,6 +133,11 @@ def run_strategy():
     execute_signal(signal)
 
     if "--confirm-buy" in sys.argv:
+        if not REAL_TRADING:
+            logger.info("当前模拟模式")
+            print("当前模拟模式")
+            return
+
         client = connect_testnet()
         buy_btc_testnet(client)
 

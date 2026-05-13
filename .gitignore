@@ -5,6 +5,7 @@ __pycache__/
 .env
 *.log
 update_log.txt
+logs/
 
 quant.db
 *.sqlite

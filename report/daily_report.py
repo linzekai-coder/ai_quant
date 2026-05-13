@@ -9,6 +9,7 @@ if PROJECT_ROOT not in sys.path:
 
 from database.db import save_score
 from strategy.score import calculate_score, get_stock_name, score_level
+from utils.logger import logger
 
 
 stocks = [
@@ -78,5 +79,6 @@ filename = os.path.join(output_dir, f"report_{datetime.now().strftime('%Y%m%d')}
 with open(filename, "w", encoding="utf-8") as f:
     f.write(content)
 
+logger.info("日报已生成: %s", filename)
 print(content)
 print(f"\n日报已保存: {filename}")

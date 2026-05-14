@@ -4,10 +4,13 @@ import sqlite3
 import pandas as pd
 import streamlit as st
 
-from stock_pool import STOCK_POOL
-
 
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if PROJECT_ROOT not in os.sys.path:
+    os.sys.path.insert(0, PROJECT_ROOT)
+
+from stock_pool import STOCK_POOL
+
 DB_NAME = os.path.join(PROJECT_ROOT, "quant.db")
 STOCKS_DIR = os.path.join(PROJECT_ROOT, "data", "stocks")
 STOCK_NAMES = {

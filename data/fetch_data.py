@@ -1,17 +1,18 @@
 import akshare as ak
 import pandas as pd
 import os
+import sys
+
+PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, PROJECT_ROOT)
+
+from stock_pool import get_fetch_stocks
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 OUTPUT_DIR = os.path.join(BASE_DIR, "stocks")
 
-# 默认股票列表 (代码: 名称) → akshare 只需纯数字代码
-DEFAULT_STOCKS = {
-    "sz.000001": "平安银行",
-    "sh.600519": "贵州茅台",
-    "sz.000858": "五粮液",
-    "sz.002415": "海康威视"
-}
+DEFAULT_STOCKS = get_fetch_stocks()
 
 __all__ = ['fetch_stock_data', 'DEFAULT_STOCKS', 'OUTPUT_DIR']
 

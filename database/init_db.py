@@ -19,6 +19,22 @@ CREATE TABLE IF NOT EXISTS stock_scores (
 )
 """)
 
+cursor.execute("""
+CREATE TABLE IF NOT EXISTS score_validation (
+    score_id INTEGER PRIMARY KEY,
+    stock_code TEXT NOT NULL,
+    score REAL NOT NULL,
+    level TEXT NOT NULL,
+    score_date TEXT NOT NULL,
+    base_close REAL,
+    return_1d REAL,
+    return_3d REAL,
+    return_5d REAL,
+    return_10d REAL,
+    evaluated_at TEXT
+)
+""")
+
 conn.commit()
 
 conn.close()

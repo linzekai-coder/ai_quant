@@ -9,21 +9,14 @@ if PROJECT_ROOT not in sys.path:
 
 from database.db import save_score
 from strategy.score import calculate_score, get_stock_name, score_level
+from stock_pool import STOCK_CODES
 from utils.logger import logger
-
-
-stocks = [
-    "000001",
-    "600519",
-    "000858",
-    "002415"
-]
 
 
 def generate_daily_report():
     results = []
 
-    for stock in stocks:
+    for stock in STOCK_CODES:
         score = calculate_score(stock)
         level = score_level(score)
         name = get_stock_name(stock)

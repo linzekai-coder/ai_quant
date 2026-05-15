@@ -28,6 +28,8 @@ def fetch_stock_data(stocks=None, output_dir=None):
     os.makedirs(output_dir, exist_ok=True)
     print(f"输出目录: {output_dir}")
 
+    success_count = 0
+
     try:
         for code, name in stocks.items():
             try:
@@ -81,6 +83,7 @@ def fetch_stock_data(stocks=None, output_dir=None):
                     index=False,
                     encoding="utf-8-sig"
                 )
+                success_count += 1
 
                 print(f"{code}({name}) 成功，共 {len(df)} 条")
 
@@ -94,7 +97,7 @@ def fetch_stock_data(stocks=None, output_dir=None):
         print(f"处理异常: {e}")
         return False
 
-    return True
+    return success_count > 0
 
 def main():
     fetch_stock_data()

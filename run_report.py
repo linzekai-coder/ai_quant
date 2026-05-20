@@ -1,11 +1,13 @@
 from report.daily_candidates import generate_daily_candidates
 from report.daily_report import generate_daily_report
 from report.score_validation import generate_validation_report
+from news.free_news_sentiment import analyze_watchlist_news
 from utils.logger import logger
 from utils.notify import send_message
 
 
 try:
+    analyze_watchlist_news()
     generate_daily_candidates()
     generate_daily_report()
     generate_validation_report()

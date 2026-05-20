@@ -10,6 +10,7 @@ if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
 
 from database.daily_candidates import save_daily_candidates
+from database.news_sentiment import get_news_sentiment
 from stock_pool import DEFAULT_STOCK_POOL
 
 
@@ -78,9 +79,23 @@ def score_candidate(df):
         score += 20
         reasons.append("20日波动率可控")
 
+    trade_date = latest["date"].strftime("%Y-%m-%d")
+    stock_code = latest["stock_code"]
+    news_sentiment = get_news_sentiment(stock_code, trade_date)
+    if news_sentiment and news_sentiment.get("sentiment") != "无数据":
+        sentiment_score = float(news_sentiment.get("final_sentiment_score", news_sentiment.get("sentiment_score", 0)) or 0)
+        sentiment = news_sentiment.get("sentiment", "中性")
+        if sentiment_score > 0.3:
+            score += 10
+        elif sentiment_score < -0.3:
+            score -= 10
+        reasons.append(f"新闻情绪：{sentiment}")
+    else:
+        reasons.append("新闻情绪：无数据")
+
     return {
-        "trade_date": latest["date"].strftime("%Y-%m-%d"),
-        "stock_code": latest["stock_code"],
+        "trade_date": trade_date,
+        "stock_code": stock_code,
         "stock_name": latest["stock_name"],
         "score": round(float(score), 2),
         "reason": "；".join(reasons) or "规则评分未触发明显优势",

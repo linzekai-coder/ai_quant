@@ -24,6 +24,14 @@ def init_watchlist_table(conn):
         updated_at TEXT NOT NULL
     )
     """)
+    columns = {
+        row[1]
+        for row in conn.execute("PRAGMA table_info(watchlist)").fetchall()
+    }
+    if "pinned" not in columns:
+        conn.execute("ALTER TABLE watchlist ADD COLUMN pinned INTEGER NOT NULL DEFAULT 0")
+    if "group_name" not in columns:
+        conn.execute("ALTER TABLE watchlist ADD COLUMN group_name TEXT NOT NULL DEFAULT '默认'")
     conn.commit()
 
 
@@ -39,7 +47,7 @@ def list_watchlist(enabled_only=False):
     if enabled_only:
         sql += " WHERE enabled = ?"
         params = (1,)
-    sql += " ORDER BY enabled DESC, stock_code"
+    sql += " ORDER BY pinned DESC, enabled DESC, group_name, stock_code"
 
     rows = conn.execute(sql, params).fetchall()
     columns = [item[0] for item in conn.execute(sql, params).description]
@@ -47,7 +55,7 @@ def list_watchlist(enabled_only=False):
     return [dict(zip(columns, row)) for row in rows]
 
 
-def upsert_watchlist_stock(stock_code, stock_name, source="manual", enabled=1, note=None):
+def upsert_watchlist_stock(stock_code, stock_name, source="manual", enabled=1, note=None, group_name="默认", pinned=0):
     stock_code = str(stock_code).zfill(6)
     timestamp = now_text()
 
@@ -60,15 +68,18 @@ def upsert_watchlist_stock(stock_code, stock_name, source="manual", enabled=1, n
         source,
         enabled,
         note,
+        group_name,
+        pinned,
         created_at,
         updated_at
     )
-    VALUES (?, ?, ?, ?, ?, ?, ?)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
     ON CONFLICT(stock_code) DO UPDATE SET
         stock_name = excluded.stock_name,
         source = excluded.source,
         enabled = excluded.enabled,
         note = excluded.note,
+        group_name = excluded.group_name,
         updated_at = excluded.updated_at
     """, (
         stock_code,
@@ -76,6 +87,8 @@ def upsert_watchlist_stock(stock_code, stock_name, source="manual", enabled=1, n
         source,
         int(enabled),
         note,
+        group_name or "默认",
+        int(pinned),
         timestamp,
         timestamp,
     ))
@@ -91,6 +104,30 @@ def set_watchlist_enabled(stock_code, enabled):
     SET enabled = ?, updated_at = ?
     WHERE stock_code = ?
     """, (int(enabled), now_text(), str(stock_code).zfill(6)))
+    conn.commit()
+    conn.close()
+
+
+def set_watchlist_pinned(stock_code, pinned):
+    conn = sqlite3.connect(DB_NAME)
+    init_watchlist_table(conn)
+    conn.execute("""
+    UPDATE watchlist
+    SET pinned = ?, updated_at = ?
+    WHERE stock_code = ?
+    """, (int(pinned), now_text(), str(stock_code).zfill(6)))
+    conn.commit()
+    conn.close()
+
+
+def set_watchlist_group(stock_code, group_name):
+    conn = sqlite3.connect(DB_NAME)
+    init_watchlist_table(conn)
+    conn.execute("""
+    UPDATE watchlist
+    SET group_name = ?, updated_at = ?
+    WHERE stock_code = ?
+    """, (group_name or "默认", now_text(), str(stock_code).zfill(6)))
     conn.commit()
     conn.close()
 

@@ -14,5 +14,6 @@ quant.db
 
 report/output/
 backtest_result.png
+data/news_cache/
 
 .streamlit/secrets.toml

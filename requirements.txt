@@ -1,9 +1,12 @@
 pandas
 numpy
 matplotlib
-akshare
 baostock
 openai
 streamlit
 python-binance
 requests
+plotly
+tushare
+apscheduler
+feedparser

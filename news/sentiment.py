@@ -22,10 +22,29 @@ import time
 import re
 
 MODEL = "deepseek-chat"   # 也可用 deepseek-reasoner
+PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+
+def _get_env_value(name):
+    value = os.getenv(name, "").strip()
+    if value:
+        return value
+    env_path = os.path.join(PROJECT_ROOT, ".env")
+    if not os.path.exists(env_path):
+        return ""
+    try:
+        with open(env_path, "r", encoding="utf-8-sig") as file_obj:
+            for line in file_obj:
+                key, _, raw_value = line.strip().partition("=")
+                if key == name and raw_value:
+                    return raw_value.strip().strip('"').strip("'")
+    except OSError:
+        return ""
+    return ""
 
 
 def _get_client():
-    api_key = os.getenv("DEEPSEEK_API_KEY")
+    api_key = _get_env_value("DEEPSEEK_API_KEY")
     if not api_key:
         return None
 

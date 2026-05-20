@@ -1,4 +1,3 @@
-import akshare as ak
 import pandas as pd
 import os
 import sys
@@ -8,6 +7,7 @@ if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
 
 from stock_pool import get_fetch_stocks
+from data.tushare_provider import fetch_daily_price
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 OUTPUT_DIR = os.path.join(BASE_DIR, "stocks")
@@ -16,9 +16,18 @@ DEFAULT_STOCKS = get_fetch_stocks()
 
 __all__ = ['fetch_stock_data', 'DEFAULT_STOCKS', 'OUTPUT_DIR']
 
+
+def safe_filename(name, fallback):
+    text = str(name).strip()
+    for char in '<>:"/\\|?*':
+        text = text.replace(char, "_")
+    text = "".join("_" if ord(char) < 32 else char for char in text).strip(" .")
+    return text or str(fallback).zfill(6)
+
+
 def fetch_stock_data(stocks=None, output_dir=None):
     """
-    获取股票历史数据并保存为CSV（AKShare版）
+    获取股票历史数据并保存为CSV（Tushare版）
     """
     if stocks is None:
         stocks = DEFAULT_STOCKS
@@ -35,34 +44,22 @@ def fetch_stock_data(stocks=None, output_dir=None):
             try:
                 print(f"正在获取: {code} {name}")
 
-                # AKShare 获取日K数据（前复权）
-                df = ak.stock_zh_a_hist(
-                    symbol=code,
-                    period="daily",
+                df = fetch_daily_price(
+                    code,
                     start_date="20000101",
                     end_date="20500101",
-                    adjust="qfq"
+                    adjust="qfq",
                 )
 
                 if df.empty:
                     print(f"{code}({name}) 无数据")
                     continue
 
-                # 重命名列 → 与原 baostock 格式一致
-                df = df.rename(columns={
-                    "日期": "日期",
-                    "开盘": "开盘",
-                    "最高": "最高",
-                    "最低": "最低",
-                    "收盘": "收盘",
-                    "成交量": "成交量",
-                    "成交额": "成交额",
-                    "涨跌幅": "涨跌幅",
-                    "换手率": "换手率"
-                })
-
                 # 补充缺少的字段（兼容原有结构）
-                df["前收盘"] = df["收盘"].shift(1)  # 用前一天收盘价模拟
+                if "前收盘" not in df.columns:
+                    df["前收盘"] = df["收盘"].shift(1)
+                if "换手率" not in df.columns:
+                    df["换手率"] = pd.NA
                 df["股票名称"] = name
                 df["代码"] = code
 
@@ -77,7 +74,7 @@ def fetch_stock_data(stocks=None, output_dir=None):
                 df = df[[col for col in final_cols if col in df.columns]]
 
                 # 保存 CSV
-                filename = f"{name}.csv"
+                filename = f"{safe_filename(name, code)}.csv"
                 df.to_csv(
                     os.path.join(output_dir, filename),
                     index=False,
@@ -91,7 +88,7 @@ def fetch_stock_data(stocks=None, output_dir=None):
                 print(f"{code}({name}) 失败: {str(e)}")
                 continue
 
-        print("全部股票处理完成 ✅")
+        print("全部股票处理完成")
 
     except Exception as e:
         print(f"处理异常: {e}")

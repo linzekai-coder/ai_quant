@@ -1,8 +1,7 @@
-import akshare as ak
-import pandas as pd
+from data.tushare_provider import fetch_daily_price
 
 # 获取平安银行(000001) 日K数据
-df = ak.stock_zh_a_hist(symbol="000001", period="daily", start_date="20240101", end_date="20241231", adjust="qfq")
+df = fetch_daily_price("000001", start_date="20240101", end_date="20241231", adjust="qfq")
 
 # 打印前5行看看
 print(df.head())

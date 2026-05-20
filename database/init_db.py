@@ -8,6 +8,8 @@ if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
 
 from database.watchlist import seed_default_watchlist
+from database.news_sentiment import init_stock_news_sentiment_table
+from database.news_raw import init_news_fetch_state_table, init_news_raw_table
 from stock_pool import DEFAULT_STOCK_POOL
 
 DB_NAME = os.path.join(PROJECT_ROOT, "quant.db")
@@ -71,6 +73,10 @@ CREATE TABLE IF NOT EXISTS daily_candidates (
 """)
 
 conn.commit()
+
+init_stock_news_sentiment_table(conn)
+init_news_raw_table(conn)
+init_news_fetch_state_table(conn)
 
 conn.close()
 

@@ -4,6 +4,7 @@ import numpy as np
 import pandas as pd
 
 from news.sentiment import analyze_news
+from database.news_sentiment import get_news_sentiment
 
 
 def get_news_score(news):
@@ -15,6 +16,19 @@ def get_news_score(news):
         return 15
     else:
         return 0
+
+
+def get_saved_news_score(stock_code, trade_date):
+    sentiment = get_news_sentiment(stock_code, trade_date)
+    if not sentiment or sentiment.get("sentiment") == "无数据":
+        return 0
+
+    score = float(sentiment.get("final_sentiment_score", sentiment.get("sentiment_score", 0)) or 0)
+    if score > 0.3:
+        return 10
+    if score < -0.3:
+        return -10
+    return 0
 
 
 def score_level(score):
@@ -93,8 +107,8 @@ def calculate_score(stock_code):
     else:
         score += 10
 
-    sample_news = "公司获得大型战略合作"
-    score += get_news_score(sample_news)
+    trade_date = latest["日期"].strftime("%Y-%m-%d")
+    score += get_saved_news_score(str(df.iloc[-1].get("代码", stock_code)).zfill(6), trade_date)
 
     return int(score)
 

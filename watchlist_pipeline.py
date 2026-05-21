@@ -5,7 +5,7 @@ from database.db import save_score
 from strategy.score import calculate_score, score_level
 
 
-def process_watchlist_stock(stock_code, stock_name):
+def process_watchlist_stock(stock_code, stock_name, score_weights=None):
     stock_code = str(stock_code).zfill(6)
     stock_name = str(stock_name).strip()
 
@@ -24,7 +24,7 @@ def process_watchlist_stock(stock_code, stock_name):
         }
 
     try:
-        score = calculate_score(csv_path)
+        score = calculate_score(csv_path, weights=score_weights)
         level = score_level(score)
         save_score(stock_code, score, level)
     except Exception as exc:

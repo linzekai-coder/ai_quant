@@ -12,7 +12,7 @@ from openai import OpenAI
 
 from database.news_raw import has_recent_fetch, list_news_raw, now_text, set_fetch_state, upsert_news_raw
 from database.news_sentiment import get_existing_sentiment_status, get_news_sentiment, upsert_news_sentiment
-from database.watchlist import list_watchlist
+from database.watchlist import list_all_enabled_watchlist
 from data.tushare_provider import find_stock
 from news.sentiment import analyze_sentiment
 from stock_pool import STOCK_METADATA
@@ -589,7 +589,7 @@ def fetch_and_cache_news(watchlist):
 
 def analyze_watchlist_news(target_date=None, force=False):
     trade_date = target_date or datetime.now().strftime("%Y-%m-%d")
-    watchlist = list_watchlist(enabled_only=True)
+    watchlist = list_all_enabled_watchlist()
     if not watchlist:
         return {"ok": True, "saved": 0, "skipped": 0, "failed": 0, "message": "没有启用中的自选股"}
 

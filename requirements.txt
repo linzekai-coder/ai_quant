@@ -10,3 +10,8 @@ plotly
 tushare
 apscheduler
 feedparser
+streamlit-authenticator
+bcrypt
+SQLAlchemy
+psycopg2-binary
+python-dotenv

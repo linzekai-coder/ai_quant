@@ -39,11 +39,11 @@ def get_market_code(stock_code):
     return f"sz.{code}"
 
 
-def get_stock_pool():
+def get_stock_pool(user_id=1):
     pool = []
     existing_codes = set()
 
-    def append_stock(code, name, industry=None, market_cap=None):
+    def append_stock(code, name, industry=None, market_cap=None, source="默认"):
         code = str(code).zfill(6)
         if code in existing_codes:
             return
@@ -54,13 +54,14 @@ def get_stock_pool():
             "name": name,
             "industry": industry or metadata.get("industry", "未分类"),
             "market_cap": market_cap or metadata.get("market_cap", "未分类"),
+            "source": source,
         })
         existing_codes.add(code)
 
     try:
         from database.watchlist import list_watchlist
 
-        rows = list_watchlist(enabled_only=True)
+        rows = list_watchlist(enabled_only=True, user_id=user_id)
     except Exception:
         rows = []
 
@@ -72,32 +73,43 @@ def get_stock_pool():
             row["stock_name"],
             industry=metadata.get("industry", "自选"),
             market_cap=metadata.get("market_cap", "未分类"),
+            source="自选",
         )
 
     try:
-        from database.daily_candidates import list_latest_candidates
+        from database.dynamic_pool import list_dynamic_pool
 
-        candidates = list_latest_candidates(enabled_only=True)
+        dynamic_rows = list_dynamic_pool(limit=20)
     except Exception:
-        candidates = []
+        dynamic_rows = []
 
-    for item in candidates:
-        code = item["stock_code"]
+    for item in dynamic_rows:
+        code = str(item["ts_code"]).split(".", 1)[0]
         metadata = STOCK_METADATA.get(code, {})
+        basic = None
+        try:
+            from data.tushare_provider import find_stock
+
+            basic = find_stock(code)
+        except Exception:
+            basic = None
         append_stock(
             code,
             item["stock_name"],
-            industry=metadata.get("industry", "推荐池"),
-            market_cap=metadata.get("market_cap", "未分类"),
+            industry=metadata.get("industry") or (basic or {}).get("industry") or "未分类",
+            market_cap=metadata.get("market_cap") or (basic or {}).get("market") or "未分类",
+            source="扫描",
         )
 
-    for item in DEFAULT_STOCK_POOL:
-        append_stock(
-            item["code"],
-            item["name"],
-            industry=item.get("industry", "未分类"),
-            market_cap=item.get("market_cap", "未分类"),
-        )
+    if not dynamic_rows and not pool:
+        for item in DEFAULT_STOCK_POOL:
+            append_stock(
+                item["code"],
+                item["name"],
+                industry=item.get("industry", "未分类"),
+                market_cap=item.get("market_cap", "未分类"),
+                source="默认",
+            )
 
     return pool
 

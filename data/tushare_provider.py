@@ -69,6 +69,11 @@ def to_ts_code(stock_code):
     return f"{code}.{suffix}"
 
 
+def ts_code_to_symbol(ts_code):
+    code = str(ts_code).strip().upper().split(".", 1)[0]
+    return normalize_stock_code(code)
+
+
 def normalize_tushare_daily(price_df):
     if price_df is None or price_df.empty:
         return pd.DataFrame()
@@ -157,6 +162,70 @@ def get_stock_basic_list():
         return pd.DataFrame()
     _STOCK_BASIC_CACHE = stock_df.copy()
     return stock_df
+
+
+def fetch_trade_calendar(start_date, end_date, exchange="SSE"):
+    pro = get_tushare_client()
+    if pro is None:
+        return pd.DataFrame()
+    try:
+        df = pro.trade_cal(
+            exchange=exchange,
+            start_date=str(start_date),
+            end_date=str(end_date),
+            fields="exchange,cal_date,is_open,pretrade_date",
+        )
+    except Exception:
+        return pd.DataFrame()
+    if df is None or df.empty:
+        return pd.DataFrame()
+    return df.copy().sort_values("cal_date").reset_index(drop=True)
+
+
+def is_trade_date(trade_date):
+    cal_df = fetch_trade_calendar(trade_date, trade_date)
+    if cal_df.empty:
+        return False
+    return int(cal_df.iloc[-1].get("is_open", 0) or 0) == 1
+
+
+def latest_trade_date(date):
+    end_date = pd.to_datetime(str(date), format="%Y%m%d", errors="coerce")
+    if pd.isna(end_date):
+        return ""
+    start_date = (end_date - pd.Timedelta(days=20)).strftime("%Y%m%d")
+    cal_df = fetch_trade_calendar(start_date, end_date.strftime("%Y%m%d"))
+    if cal_df.empty:
+        return ""
+    open_dates = cal_df[cal_df["is_open"].astype(int) == 1]["cal_date"].astype(str)
+    if open_dates.empty:
+        return ""
+    return open_dates.iloc[-1]
+
+
+def fetch_all_daily(trade_date):
+    pro = get_tushare_client()
+    if pro is None:
+        return pd.DataFrame()
+    try:
+        df = pro.daily(
+            trade_date=str(trade_date),
+            fields="ts_code,trade_date,open,high,low,close,pre_close,change,pct_chg,vol,amount",
+        )
+    except Exception:
+        return pd.DataFrame()
+    if df is None or df.empty:
+        return pd.DataFrame()
+    df = df.copy()
+    for col in ["open", "high", "low", "close", "pre_close", "change", "pct_chg", "vol", "amount"]:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+    return df.dropna(subset=["ts_code", "trade_date", "close"]).reset_index(drop=True)
+
+
+def fetch_daily_by_ts_code(ts_code, start_date, end_date, adjust="qfq"):
+    code = ts_code_to_symbol(ts_code)
+    return fetch_daily_price(code, start_date, end_date, adjust=adjust)
 
 
 def find_stock(stock_code):

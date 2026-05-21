@@ -1,0 +1,73 @@
+services:
+  db:
+    image: postgres:16
+    container_name: ai_quant_db
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: quant_db
+      POSTGRES_USER: quant_user
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-change_me_strong_password}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U quant_user -d quant_db"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  app:
+    build: .
+    container_name: ai_quant_app
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql://quant_user:${POSTGRES_PASSWORD:-change_me_strong_password}@db:5432/quant_db
+      TUSHARE_TOKEN: ${TUSHARE_TOKEN}
+      NEWSAPI_KEY: ${NEWSAPI_KEY}
+      SECRET_KEY: ${SECRET_KEY}
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD}
+      PYTHONPATH: /app
+    volumes:
+      - ./data:/app/data
+      - ./logs:/app/logs
+      - ./report/output:/app/report/output
+    expose:
+      - "8501"
+
+  scheduler:
+    build: .
+    container_name: ai_quant_scheduler
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql://quant_user:${POSTGRES_PASSWORD:-change_me_strong_password}@db:5432/quant_db
+      TUSHARE_TOKEN: ${TUSHARE_TOKEN}
+      NEWSAPI_KEY: ${NEWSAPI_KEY}
+      SECRET_KEY: ${SECRET_KEY}
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD}
+      PYTHONPATH: /app
+    volumes:
+      - ./data:/app/data
+      - ./logs:/app/logs
+      - ./report/output:/app/report/output
+    command: ["python", "scheduler.py"]
+
+  nginx:
+    image: nginx:1.27-alpine
+    container_name: ai_quant_nginx
+    restart: unless-stopped
+    depends_on:
+      - app
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./deploy/nginx.conf:/etc/nginx/conf.d/default.conf:ro
+      - ./deploy/certs:/etc/nginx/certs:ro
+
+volumes:
+  postgres_data:

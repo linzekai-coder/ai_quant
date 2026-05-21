@@ -73,9 +73,41 @@ def _resolve_stock_csv(stock_code):
     return direct_path
 
 
-def calculate_score(stock_code):
+DEFAULT_SCORE_WEIGHTS = {
+    "technical": 0.5,
+    "fundamental": 0.2,
+    "sentiment": 0.3,
+}
+
+
+def normalize_score_weights(weights=None):
+    config = DEFAULT_SCORE_WEIGHTS.copy()
+    if weights:
+        config.update({
+            key: float(value)
+            for key, value in weights.items()
+            if key in config
+        })
+    total = sum(config.values())
+    if total <= 0:
+        return DEFAULT_SCORE_WEIGHTS.copy()
+    return {key: value / total for key, value in config.items()}
+
+
+def calculate_score(stock_code, weights=None):
     csv_path = _resolve_stock_csv(stock_code)
     df = pd.read_csv(csv_path)
+
+    code_for_news = str(stock_code)
+    if "代码" in df.columns and not df.empty:
+        code_for_news = str(df.iloc[-1].get("代码", stock_code)).zfill(6)
+
+    return calculate_score_from_frame(df, code_for_news, weights=weights)
+
+
+def calculate_score_from_frame(dataframe, stock_code=None, weights=None):
+    weights = normalize_score_weights(weights)
+    df = dataframe.copy()
 
     df["日期"] = pd.to_datetime(df["日期"])
     df = df.sort_values("日期").reset_index(drop=True)
@@ -90,27 +122,37 @@ def calculate_score(stock_code):
     df["MA20"] = df["收盘"].rolling(20).mean()
 
     latest = df.iloc[-1]
-    score = 0
 
-    # 技术面（40）
-    if latest["MA5"] > latest["MA20"]:
-        score += 40
+    technical_score = 80 if latest["MA5"] > latest["MA20"] else 35
 
-    # 风险面（30）
     returns = df["收盘"].pct_change().replace([np.inf, -np.inf], np.nan).dropna()
     volatility = returns.std()
-
     if volatility < 0.02:
-        score += 30
+        risk_score = 80
     elif volatility < 0.04:
-        score += 20
+        risk_score = 60
     else:
-        score += 10
+        risk_score = 40
+    technical_score = (technical_score + risk_score) / 2
 
     trade_date = latest["日期"].strftime("%Y-%m-%d")
-    score += get_saved_news_score(str(df.iloc[-1].get("代码", stock_code)).zfill(6), trade_date)
+    sentiment_score = 50
+    news_code = stock_code
+    if news_code is None and "代码" in df.columns:
+        news_code = df.iloc[-1].get("代码")
+    if news_code is not None:
+        sentiment_score += get_saved_news_score(str(news_code).zfill(6), trade_date) * 2
+    sentiment_score = max(0, min(100, sentiment_score))
 
-    return int(score)
+    # 基本面数据源后续接入；当前用中性分作为权重占位，避免权重配置无效。
+    fundamental_score = 60
+    score = (
+        technical_score * weights["technical"]
+        + fundamental_score * weights["fundamental"]
+        + sentiment_score * weights["sentiment"]
+    )
+
+    return int(round(max(0, min(100, score))))
 
 
 if __name__ == "__main__":

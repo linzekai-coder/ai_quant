@@ -1,20 +1,19 @@
-import os
-import sqlite3
 from datetime import datetime, timedelta
 
+from sqlalchemy import text
 
-PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-DB_NAME = os.path.join(PROJECT_ROOT, "quant.db")
+from database.connection import engine, is_postgres
 
 
 def now_text():
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
 
-def init_news_raw_table(conn):
-    conn.execute("""
+def init_news_raw_table(conn=None):
+    id_type = "SERIAL PRIMARY KEY" if is_postgres() else "INTEGER PRIMARY KEY AUTOINCREMENT"
+    ddl = f"""
     CREATE TABLE IF NOT EXISTS news_raw (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        id {id_type},
         source_type TEXT NOT NULL,
         source_name TEXT NOT NULL,
         stock_code TEXT,
@@ -25,16 +24,25 @@ def init_news_raw_table(conn):
         created_at TEXT NOT NULL,
         UNIQUE(title, published_time)
     )
-    """)
-    conn.execute("CREATE INDEX IF NOT EXISTS idx_news_raw_type_time ON news_raw(source_type, published_time)")
-    conn.execute("CREATE INDEX IF NOT EXISTS idx_news_raw_stock_time ON news_raw(stock_code, published_time)")
-    conn.commit()
+    """
+    idx_type = "CREATE INDEX IF NOT EXISTS idx_news_raw_type_time ON news_raw(source_type, published_time)"
+    idx_stock = "CREATE INDEX IF NOT EXISTS idx_news_raw_stock_time ON news_raw(stock_code, published_time)"
+    if conn is not None:
+        conn.execute(ddl)
+        conn.execute(idx_type)
+        conn.execute(idx_stock)
+        return
+    with engine.begin() as db:
+        db.execute(text(ddl))
+        db.execute(text(idx_type))
+        db.execute(text(idx_stock))
 
 
-def init_news_fetch_state_table(conn):
-    conn.execute("""
+def init_news_fetch_state_table(conn=None):
+    id_type = "SERIAL PRIMARY KEY" if is_postgres() else "INTEGER PRIMARY KEY AUTOINCREMENT"
+    ddl = f"""
     CREATE TABLE IF NOT EXISTS news_fetch_state (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        id {id_type},
         source_type TEXT NOT NULL,
         cache_key TEXT NOT NULL,
         fetched_at TEXT NOT NULL,
@@ -42,151 +50,160 @@ def init_news_fetch_state_table(conn):
         message TEXT,
         UNIQUE(source_type, cache_key)
     )
-    """)
-    conn.commit()
+    """
+    if conn is not None:
+        conn.execute(ddl)
+        return
+    with engine.begin() as db:
+        db.execute(text(ddl))
+
+
+def ensure_tables():
+    init_news_raw_table()
+    init_news_fetch_state_table()
 
 
 def cleanup_old_news(days=7):
+    ensure_tables()
     cutoff = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d %H:%M:%S")
-    conn = sqlite3.connect(DB_NAME)
-    init_news_raw_table(conn)
-    init_news_fetch_state_table(conn)
-    conn.execute("DELETE FROM news_raw WHERE published_time < ?", (cutoff,))
-    conn.commit()
-    conn.close()
+    with engine.begin() as db:
+        db.execute(text(
+            "DELETE FROM news_raw WHERE published_time < :cutoff"
+        ), {"cutoff": cutoff})
 
 
 def upsert_news_raw(items):
     if not items:
         return 0
-    conn = sqlite3.connect(DB_NAME)
-    init_news_raw_table(conn)
-    init_news_fetch_state_table(conn)
-    before = conn.total_changes
-    conn.executemany("""
-    INSERT INTO news_raw (
-        source_type,
-        source_name,
-        stock_code,
-        title,
-        summary,
-        published_time,
-        url,
-        created_at
-    )
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-    ON CONFLICT(title, published_time) DO NOTHING
-    """, [
-        (
-            item.get("source_type", ""),
-            item.get("source_name", ""),
-            item.get("stock_code"),
-            item.get("title", ""),
-            item.get("summary", ""),
-            item.get("published_time", ""),
-            item.get("url", ""),
-            item.get("created_at") or now_text(),
-        )
+    ensure_tables()
+    rows = [
+        {
+            "source_type": item.get("source_type", ""),
+            "source_name": item.get("source_name", ""),
+            "stock_code": item.get("stock_code"),
+            "title": item.get("title", ""),
+            "summary": item.get("summary", ""),
+            "published_time": item.get("published_time", ""),
+            "url": item.get("url", ""),
+            "created_at": item.get("created_at") or now_text(),
+        }
         for item in items
         if item.get("title") and item.get("published_time")
-    ])
-    inserted = conn.total_changes - before
-    conn.commit()
-    conn.close()
+    ]
+    if not rows:
+        return 0
+
+    with engine.begin() as db:
+        result = db.execute(text("""
+        INSERT INTO news_raw (
+            source_type,
+            source_name,
+            stock_code,
+            title,
+            summary,
+            published_time,
+            url,
+            created_at
+        )
+        VALUES (
+            :source_type,
+            :source_name,
+            :stock_code,
+            :title,
+            :summary,
+            :published_time,
+            :url,
+            :created_at
+        )
+        ON CONFLICT(title, published_time) DO NOTHING
+        """), rows)
     cleanup_old_news(days=7)
-    return inserted
+    return max(result.rowcount or 0, 0)
 
 
 def list_news_raw(source_type=None, stock_code=None, start_time=None, end_time=None, limit=200):
-    conn = sqlite3.connect(DB_NAME)
-    init_news_raw_table(conn)
-    init_news_fetch_state_table(conn)
+    ensure_tables()
     sql = """
     SELECT *
     FROM news_raw
     WHERE 1 = 1
     """
-    params = []
+    params = {}
     if source_type:
-        sql += " AND source_type = ?"
-        params.append(source_type)
+        sql += " AND source_type = :source_type"
+        params["source_type"] = source_type
     if stock_code is not None:
-        sql += " AND stock_code = ?"
-        params.append(str(stock_code).zfill(6))
+        sql += " AND stock_code = :stock_code"
+        params["stock_code"] = str(stock_code).zfill(6)
     if start_time:
-        sql += " AND published_time >= ?"
-        params.append(start_time)
+        sql += " AND published_time >= :start_time"
+        params["start_time"] = start_time
     if end_time:
-        sql += " AND published_time <= ?"
-        params.append(end_time)
-    sql += " ORDER BY published_time DESC LIMIT ?"
-    params.append(int(limit))
-    cursor = conn.execute(sql, params)
-    columns = [item[0] for item in cursor.description]
-    rows = [dict(zip(columns, row)) for row in cursor.fetchall()]
-    conn.close()
-    return rows
+        sql += " AND published_time <= :end_time"
+        params["end_time"] = end_time
+    sql += " ORDER BY published_time DESC LIMIT :limit"
+    params["limit"] = int(limit)
+    with engine.connect() as db:
+        rows = db.execute(text(sql), params)
+        return [dict(row._mapping) for row in rows]
 
 
 def has_news_since(source_type, since_time, stock_code=None):
-    conn = sqlite3.connect(DB_NAME)
-    init_news_raw_table(conn)
-    init_news_fetch_state_table(conn)
+    ensure_tables()
     sql = """
     SELECT 1
     FROM news_raw
-    WHERE source_type = ? AND created_at >= ?
+    WHERE source_type = :source_type AND created_at >= :since_time
     """
-    params = [source_type, since_time]
+    params = {"source_type": source_type, "since_time": since_time}
     if stock_code is not None:
-        sql += " AND stock_code = ?"
-        params.append(str(stock_code).zfill(6))
+        sql += " AND stock_code = :stock_code"
+        params["stock_code"] = str(stock_code).zfill(6)
     sql += " LIMIT 1"
-    row = conn.execute(sql, params).fetchone()
-    conn.close()
-    return row is not None
+    with engine.connect() as db:
+        return db.execute(text(sql), params).fetchone() is not None
 
 
 def get_fetch_state(source_type, cache_key):
-    conn = sqlite3.connect(DB_NAME)
-    init_news_fetch_state_table(conn)
-    cursor = conn.execute("""
-    SELECT source_type, cache_key, fetched_at, status, message
-    FROM news_fetch_state
-    WHERE source_type = ? AND cache_key = ?
-    """, (source_type, cache_key))
-    row = cursor.fetchone()
-    conn.close()
-    if row is None:
-        return None
-    return {
-        "source_type": row[0],
-        "cache_key": row[1],
-        "fetched_at": row[2],
-        "status": row[3],
-        "message": row[4],
-    }
+    init_news_fetch_state_table()
+    with engine.connect() as db:
+        row = db.execute(text("""
+        SELECT source_type, cache_key, fetched_at, status, message
+        FROM news_fetch_state
+        WHERE source_type = :source_type AND cache_key = :cache_key
+        """), {"source_type": source_type, "cache_key": cache_key}).fetchone()
+    return dict(row._mapping) if row else None
 
 
 def set_fetch_state(source_type, cache_key, status="ok", message=""):
-    conn = sqlite3.connect(DB_NAME)
-    init_news_fetch_state_table(conn)
-    conn.execute("""
-    INSERT INTO news_fetch_state (
-        source_type,
-        cache_key,
-        fetched_at,
-        status,
-        message
-    )
-    VALUES (?, ?, ?, ?, ?)
-    ON CONFLICT(source_type, cache_key) DO UPDATE SET
-        fetched_at = excluded.fetched_at,
-        status = excluded.status,
-        message = excluded.message
-    """, (source_type, cache_key, now_text(), status, message))
-    conn.commit()
-    conn.close()
+    init_news_fetch_state_table()
+    with engine.begin() as db:
+        db.execute(text("""
+        INSERT INTO news_fetch_state (
+            source_type,
+            cache_key,
+            fetched_at,
+            status,
+            message
+        )
+        VALUES (
+            :source_type,
+            :cache_key,
+            :fetched_at,
+            :status,
+            :message
+        )
+        ON CONFLICT(source_type, cache_key) DO UPDATE SET
+            fetched_at = excluded.fetched_at,
+            status = excluded.status,
+            message = excluded.message
+        """), {
+            "source_type": source_type,
+            "cache_key": cache_key,
+            "fetched_at": now_text(),
+            "status": status,
+            "message": message,
+        })
 
 
 def has_recent_fetch(source_type, cache_key, since_time):

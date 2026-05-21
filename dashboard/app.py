@@ -1,12 +1,17 @@
 import os
 import json
-import sqlite3
+import secrets
 from datetime import datetime, timedelta
 from html import escape
 
 import altair as alt
 import pandas as pd
 import streamlit as st
+from sqlalchemy import text
+try:
+    import extra_streamlit_components as stx
+except ImportError:
+    stx = None
 
 try:
     import plotly.graph_objects as go
@@ -34,8 +39,27 @@ from database.watchlist import (
     upsert_watchlist_stock,
 )
 from database.daily_candidates import list_latest_candidates
+from database.dynamic_pool import get_latest_dynamic_pool_summary, list_dynamic_pool
+from database.users import (
+    authenticate_user,
+    authenticate_remember_token,
+    clear_remember_token,
+    create_user,
+    ensure_default_admin,
+    get_user_by_id,
+    list_users,
+    save_remember_token,
+    set_user_active,
+    update_user_password,
+    validate_password_strength,
+    validate_username,
+)
+from database.connection import engine
+from database.user_settings import get_user_settings, reset_user_settings, save_user_settings
+from database.backtest_results import list_backtest_results, save_backtest_result
 from strategy.score import score_level
 from watchlist_pipeline import process_watchlist_stock
+from dynamic_pool_pipeline import DynamicPoolConfig, run_dynamic_pool_scan
 from news.free_news_sentiment import analyze_watchlist_news
 from database.news_sentiment import (
     get_news_sentiment,
@@ -44,7 +68,6 @@ from database.news_sentiment import (
 )
 from database.news_raw import list_news_raw
 
-DB_NAME = os.path.join(PROJECT_ROOT, "quant.db")
 STOCKS_DIR = os.path.join(PROJECT_ROOT, "data", "stocks")
 STOCK_POOL = get_stock_pool()
 STOCK_NAMES = {
@@ -67,6 +90,8 @@ A_SHARE_DOWN_COLOR = "#1DB954"
 A_SHARE_FLAT_COLOR = "#6b7280"
 AI_SCORE_COLOR = "#2563eb"
 LOADING_TEXT = "数据获取中..."
+SESSION_TIMEOUT_SECONDS = 8 * 60 * 60
+REMEMBER_COOKIE = "ai_quant_remember"
 
 COLUMN_LABELS = {
     "id": "ID",
@@ -94,8 +119,227 @@ COLUMN_LABELS = {
 }
 
 
+def stock_source_map():
+    return {
+        item["code"]: item.get("source", "扫描")
+        for item in STOCK_POOL
+    }
+
+
 def display_table(dataframe):
     return dataframe.rename(columns=COLUMN_LABELS)
+
+
+def clear_session_state():
+    for key in list(st.session_state.keys()):
+        del st.session_state[key]
+
+
+@st.cache_resource(show_spinner=False)
+def cookie_manager():
+    if stx is None:
+        return None
+    return stx.CookieManager()
+
+
+def read_remember_cookie():
+    manager = cookie_manager()
+    if manager is None:
+        return None, None
+    raw_value = manager.get(cookie=REMEMBER_COOKIE)
+    if not raw_value or ":" not in str(raw_value):
+        return None, None
+    user_id, token = str(raw_value).split(":", 1)
+    if not user_id.isdigit() or not token:
+        return None, None
+    return int(user_id), token
+
+
+def write_remember_cookie(user_id):
+    manager = cookie_manager()
+    if manager is None:
+        return
+    token = secrets.token_urlsafe(32)
+    expires_at = datetime.now() + timedelta(days=7)
+    save_remember_token(user_id, token, expires_at)
+    manager.set(
+        REMEMBER_COOKIE,
+        f"{user_id}:{token}",
+        expires_at=expires_at,
+        key="set_remember_cookie",
+    )
+
+
+def delete_remember_cookie(user_id=None):
+    manager = cookie_manager()
+    if user_id:
+        clear_remember_token(user_id)
+    if manager is not None:
+        manager.delete(REMEMBER_COOKIE, key="delete_remember_cookie")
+
+
+def set_current_user(user):
+    st.session_state["user_id"] = user["id"]
+    st.session_state["username"] = user["username"]
+    st.session_state["display_name"] = user["display_name"]
+    st.session_state["role"] = user["role"]
+    st.session_state["must_change_password"] = int(user.get("must_change_password", 0) or 0)
+    st.session_state["session_version"] = int(user.get("session_version", 0) or 0)
+    st.session_state["login_at"] = datetime.now().timestamp()
+    st.session_state["last_active_at"] = datetime.now().timestamp()
+
+
+def current_user():
+    user_id = st.session_state.get("user_id")
+    if not user_id:
+        return None
+    user = get_user_by_id(user_id)
+    if not user or not int(user.get("is_active", 0)):
+        return None
+    if int(user.get("session_version", 0) or 0) != int(st.session_state.get("session_version", 0) or 0):
+        return None
+    return user
+
+
+def get_current_user_id():
+    user_id = st.session_state.get("user_id")
+    if not user_id:
+        require_authentication()
+        st.stop()
+    return int(user_id)
+
+
+def get_current_user_settings():
+    return get_user_settings(get_current_user_id())
+
+
+def current_score_weights():
+    settings = get_current_user_settings()
+    return {
+        "technical": settings["score.technical_weight"],
+        "fundamental": settings["score.fundamental_weight"],
+        "sentiment": settings["score.sentiment_weight"],
+    }
+
+
+def session_expired():
+    last_active = st.session_state.get("last_active_at")
+    if not last_active:
+        return False
+    return datetime.now().timestamp() - float(last_active) > SESSION_TIMEOUT_SECONDS
+
+
+def logout():
+    delete_remember_cookie(st.session_state.get("user_id"))
+    clear_session_state()
+    st.rerun()
+
+
+def render_user_header(user):
+    cols = st.columns([4, 1.2])
+    cols[0].markdown(
+        f"<div style='text-align:right;color:#475569;padding-top:0.35rem;'>当前用户："
+        f"<strong>{escape(str(user['display_name']))}</strong></div>",
+        unsafe_allow_html=True,
+    )
+    if cols[1].button("退出登录", key="logout_button"):
+        logout()
+
+
+def render_change_password(user):
+    st.title("修改初始密码")
+    st.info("默认管理员首次登录必须修改密码后才能进入系统。")
+    with st.form("force_change_password"):
+        password = st.text_input("新密码", type="password")
+        confirm = st.text_input("确认新密码", type="password")
+        submitted = st.form_submit_button("保存并进入系统")
+        if submitted:
+            if password != confirm:
+                st.error("两次输入的密码不一致")
+                return
+            try:
+                update_user_password(user["id"], password)
+            except ValueError as exc:
+                st.error(str(exc))
+                return
+            updated = get_user_by_id(user["id"])
+            set_current_user(updated)
+            st.success("密码已更新")
+            st.rerun()
+
+
+def render_login_form():
+    st.title("AI量化交易系统")
+    tab_login, tab_register = st.tabs(["登录", "注册"])
+
+    with tab_login:
+        with st.form("login_form"):
+            username = st.text_input("用户名")
+            password = st.text_input("密码", type="password")
+            remember_me = st.checkbox("记住我（7天免登录）", value=True)
+            submitted = st.form_submit_button("登录")
+        if submitted:
+            user, error = authenticate_user(username.strip(), password)
+            if error:
+                st.error(error)
+            else:
+                set_current_user(user)
+                st.session_state["remember_me"] = bool(remember_me)
+                if remember_me:
+                    write_remember_cookie(user["id"])
+                st.rerun()
+
+    with tab_register:
+        with st.form("register_form"):
+            username = st.text_input("用户名", key="register_username")
+            display_name = st.text_input("昵称")
+            email = st.text_input("邮箱")
+            password = st.text_input("密码", type="password", key="register_password")
+            confirm = st.text_input("确认密码", type="password")
+            submitted = st.form_submit_button("注册并登录")
+        if submitted:
+            if not validate_username(username.strip()):
+                st.error("用户名只允许字母、数字、下划线，长度 3-20 位")
+                return
+            if password != confirm:
+                st.error("两次输入的密码不一致")
+                return
+            if not validate_password_strength(password):
+                st.error("密码至少 8 位，且必须包含字母和数字")
+                return
+            try:
+                user = create_user(username, display_name, email, password)
+            except ValueError as exc:
+                st.error(str(exc))
+                return
+            set_current_user(user)
+            st.rerun()
+
+
+def require_authentication():
+    ensure_default_admin()
+    if session_expired():
+        clear_session_state()
+        st.warning("登录已超时，请重新登录")
+
+    user = current_user()
+    if not user:
+        cookie_user_id, token = read_remember_cookie()
+        if cookie_user_id and token:
+            remembered = authenticate_remember_token(cookie_user_id, token)
+            if remembered:
+                set_current_user(remembered)
+                user = remembered
+
+    if not user:
+        render_login_form()
+        st.stop()
+
+    st.session_state["last_active_at"] = datetime.now().timestamp()
+    if int(user.get("must_change_password", 0) or 0):
+        render_change_password(user)
+        st.stop()
+    return user
 
 
 def pick_column(dataframe, candidates, fallback_index):
@@ -143,7 +387,7 @@ def get_stock_metadata(stock_code):
     if local_metadata:
         local_industry = local_metadata.get("industry", "未分类")
         local_market_cap = local_metadata.get("market_cap", "未分类")
-        if local_industry not in ("自选", "推荐池", "未分类"):
+        if local_industry not in ("自选", "推荐池", "扫描", "未分类"):
             return local_metadata
         if basic:
             return {
@@ -171,6 +415,22 @@ def industry_badge_html(industry, market_cap=None):
         "<span style='display:inline-flex;align-items:center;padding:0.18rem 0.54rem;"
         "border-radius:999px;background:#eef2ff;color:#3730a3;border:1px solid #c7d2fe;"
         f"font-size:0.82rem;font-weight:700;'>{label}</span>"
+    )
+
+
+def source_badge_html(source):
+    source = str(source or "扫描")
+    styles = {
+        "自选": "background:#dcfce7;color:#166534;border:1px solid #86efac;",
+        "扫描": "background:#dbeafe;color:#1d4ed8;border:1px solid #93c5fd;",
+        "默认": "background:#f3f4f6;color:#374151;border:1px solid #d1d5db;",
+    }
+    style = styles.get(source, styles["扫描"])
+    return (
+        "<span style='display:inline-flex;align-items:center;justify-content:center;"
+        "min-width:3rem;padding:0.18rem 0.54rem;border-radius:999px;"
+        f"font-size:0.82rem;font-weight:800;{style}'>"
+        f"{escape(source)}</span>"
     )
 
 
@@ -1142,8 +1402,8 @@ def apply_theme():
 
 
 def load_score_data():
-    conn = sqlite3.connect(DB_NAME)
-    df = pd.read_sql("""
+    with engine.connect() as conn:
+        df = pd.read_sql(text("""
     SELECT *
     FROM stock_scores
     WHERE id IN (
@@ -1152,45 +1412,42 @@ def load_score_data():
         GROUP BY stock_code
     )
     ORDER BY score DESC, created_at DESC
-    """, conn)
+    """), conn)
 
-    try:
-        validation_df = pd.read_sql("""
+        try:
+            validation_df = pd.read_sql(text("""
         SELECT *
         FROM score_validation
         ORDER BY score_date DESC, score DESC
-        """, conn)
-    except Exception:
-        validation_df = pd.DataFrame()
+        """), conn)
+        except Exception:
+            validation_df = pd.DataFrame()
 
-    conn.close()
     return df, validation_df
 
 
 def load_history_data(stock_code):
-    conn = sqlite3.connect(DB_NAME)
-    history_df = pd.read_sql("""
+    with engine.connect() as conn:
+        history_df = pd.read_sql(text("""
     SELECT *
     FROM stock_scores
-    WHERE stock_code = ?
+    WHERE stock_code = :stock_code
     ORDER BY created_at
-    """, conn, params=(stock_code,))
-    conn.close()
+    """), conn, params={"stock_code": stock_code})
     return history_df
 
 
 def load_candidate_reasons(stock_code):
-    conn = sqlite3.connect(DB_NAME)
-    try:
-        reasons_df = pd.read_sql("""
+    with engine.connect() as conn:
+        try:
+            reasons_df = pd.read_sql(text("""
         SELECT trade_date, stock_code, reason
         FROM daily_candidates
-        WHERE stock_code = ?
+        WHERE stock_code = :stock_code
         ORDER BY trade_date
-        """, conn, params=(str(stock_code).zfill(6),))
-    except Exception:
-        reasons_df = pd.DataFrame()
-    conn.close()
+        """), conn, params={"stock_code": str(stock_code).zfill(6)})
+        except Exception:
+            reasons_df = pd.DataFrame()
     return reasons_df
 
 
@@ -1218,6 +1475,98 @@ def render_metrics(dataframe):
         """,
         unsafe_allow_html=True,
     )
+
+
+def render_market_scan_card():
+    settings = get_current_user_settings()
+    summary = get_latest_dynamic_pool_summary()
+    scan_cols = st.columns(4)
+    if summary is None:
+        scan_cols[0].metric("扫描股票数", "--")
+        scan_cols[1].metric("通过筛选数", "--")
+        scan_cols[2].metric("最高评分", "--")
+        scan_cols[3].metric("扫描完成时间", "尚未执行")
+    else:
+        scan_cols[0].metric("扫描股票数", summary.get("scanned_count", "--"))
+        scan_cols[1].metric("通过筛选数", summary["selected_count"])
+        max_score = summary["max_ai_score"]
+        scan_cols[2].metric("最高评分", "--" if pd.isna(max_score) else f"{float(max_score):.1f}")
+        scan_cols[3].metric("扫描完成时间", summary["completed_at"] or "--")
+
+    with st.expander("今日全市场扫描参数", expanded=False):
+        form_cols = st.columns([1, 1, 1, 1, 1, 1])
+        min_amount = form_cols[0].number_input(
+            "成交额门槛（亿元）",
+            min_value=0.1,
+            max_value=50.0,
+            value=float(st.session_state.get("scan_min_amount_yi", settings["filter.min_amount_yi"])),
+            step=0.5,
+            key="scan_min_amount_yi",
+        )
+        volume_ratio = form_cols[1].number_input(
+            "量比门槛",
+            min_value=0.5,
+            max_value=5.0,
+            value=float(st.session_state.get("scan_volume_ratio", settings["filter.volume_ratio"])),
+            step=0.1,
+            key="scan_volume_ratio",
+        )
+        min_close = form_cols[2].number_input(
+            "最低收盘价",
+            min_value=0.1,
+            max_value=100.0,
+            value=float(st.session_state.get("scan_min_close", 3.0)),
+            step=0.5,
+            key="scan_min_close",
+        )
+        top_n = form_cols[3].number_input(
+            "动态池数量",
+            min_value=5,
+            max_value=100,
+            value=int(st.session_state.get("scan_top_n", settings["recommend.top_n"])),
+            step=5,
+            key="scan_top_n",
+        )
+        max_workers = form_cols[4].number_input(
+            "并发数",
+            min_value=1,
+            max_value=20,
+            value=int(st.session_state.get("scan_max_workers", 10)),
+            step=1,
+            key="scan_max_workers",
+        )
+        run_scan = form_cols[5].button("立即扫描", key="run_market_scan")
+
+        if run_scan:
+            if not settings["recommend.enable_market_scan"]:
+                st.warning("你的个人设置已关闭全市场扫描")
+                return
+            config = DynamicPoolConfig(
+                min_amount_yuan=float(min_amount) * 100000000,
+                volume_ratio_threshold=float(volume_ratio),
+                min_close=float(min_close),
+                top_n=int(top_n),
+                max_workers=int(max_workers),
+                score_weights=current_score_weights(),
+            )
+            with st.spinner("正在执行全市场扫描与评分..."):
+                result = run_dynamic_pool_scan(config=config)
+            st.session_state["market_scan_result"] = result
+            st.session_state["last_scan_count"] = result.get("scanned_count", "--")
+            st.rerun()
+
+    result = st.session_state.get("market_scan_result")
+    if result:
+        if result.get("ok"):
+            st.success(
+                f"{result.get('trade_date')} 扫描完成："
+                f"静态通过 {result.get('static_pass_count')}，"
+                f"行情通过 {result.get('daily_pass_count')}，"
+                f"评分通过 {result.get('scored_count')}，"
+                f"入选 {result.get('selected_count')}"
+            )
+        else:
+            st.info(result.get("message", "全市场扫描已跳过"))
 
 
 def render_news_sentiment_controls():
@@ -1265,21 +1614,22 @@ def render_news_sentiment_controls():
 
 
 def load_news_sentiments_by_date(trade_date):
-    conn = sqlite3.connect(DB_NAME)
-    try:
-        rows_df = pd.read_sql("""
+    user_id = get_current_user_id()
+    with engine.connect() as conn:
+        try:
+            rows_df = pd.read_sql(text("""
         SELECT
             s.*,
             COALESCE(w.stock_name, '') AS stock_name
         FROM stock_news_sentiment s
         LEFT JOIN watchlist w
             ON w.stock_code = s.stock_code
-        WHERE s.trade_date = ?
+            AND w.user_id = :user_id
+        WHERE s.trade_date = :trade_date
         ORDER BY s.final_sentiment_score DESC, s.stock_code
-        """, conn, params=(trade_date,))
-    except Exception:
-        rows_df = pd.DataFrame()
-    conn.close()
+        """), conn, params={"trade_date": trade_date, "user_id": user_id})
+        except Exception:
+            rows_df = pd.DataFrame()
     if rows_df.empty:
         return []
 
@@ -1617,11 +1967,14 @@ def render_stock_pool_overview(pool):
         st.info("当前筛选条件下暂无股票")
         return
 
-    view = filtered_df[["code", "name", "industry", "market_cap"]].rename(columns={
+    if "source" not in filtered_df.columns:
+        filtered_df["source"] = "扫描"
+    view = filtered_df[["code", "name", "industry", "market_cap", "source"]].rename(columns={
         "code": "股票代码",
         "name": "股票名称",
         "industry": "行业",
         "market_cap": "市值",
+        "source": "来源",
     })
     st.dataframe(view, use_container_width=True, hide_index=True)
 
@@ -1666,6 +2019,7 @@ def apply_score_filters(dataframe, filtered_pool):
 
 def render_watchlist_manager():
     st.subheader("自选股管理")
+    user_id = get_current_user_id()
 
     if "watchlist_pipeline_message" in st.session_state:
         message = st.session_state.pop("watchlist_pipeline_message")
@@ -1674,7 +2028,7 @@ def render_watchlist_manager():
         else:
             st.warning(message["text"])
 
-    watchlist_rows = list_watchlist()
+    watchlist_rows = list_watchlist(user_id=user_id)
     if "watchlist_detail_code" not in st.session_state:
         st.session_state["watchlist_detail_code"] = None
     if "watchlist_delete_code" not in st.session_state:
@@ -1727,20 +2081,25 @@ def render_watchlist_manager():
                 stock_code,
                 stock_name,
                 note=note.strip() or None,
+                user_id=user_id,
             )
             get_recent_price_data.clear()
             get_spot_market_data.clear()
             get_spot_stock_quote(stock_code)
             get_recent_price_data(stock_code)
             with st.spinner("正在采集行情并生成评分..."):
-                result = process_watchlist_stock(stock_code, stock_name)
+                result = process_watchlist_stock(
+                    stock_code,
+                    stock_name,
+                    score_weights=current_score_weights(),
+                )
             st.session_state["watchlist_pipeline_message"] = {
                 "ok": result["ok"],
                 "text": result["message"],
             }
             st.rerun()
 
-    watchlist_df = pd.DataFrame(list_watchlist())
+    watchlist_df = pd.DataFrame(list_watchlist(user_id=user_id))
     if watchlist_df.empty:
         st.info("暂无自选股")
         return
@@ -1830,7 +2189,7 @@ def render_watchlist_manager():
                     st.session_state["selected_stock_code"] = stock_code
                 toggle_label = "停用" if enabled else "启用"
                 if action_cols[1].button(toggle_label, key=f"watch_toggle_{stock_code}"):
-                    set_watchlist_enabled(stock_code, 0 if enabled else 1)
+                    set_watchlist_enabled(stock_code, 0 if enabled else 1, user_id=user_id)
                     st.rerun()
                 if action_cols[2].button("删除", key=f"watch_delete_{stock_code}"):
                     st.session_state["watchlist_delete_code"] = stock_code
@@ -1839,7 +2198,7 @@ def render_watchlist_manager():
                     st.warning(f"确认删除 {stock_code} {stock_name}？")
                     confirm_cols = st.columns(2)
                     if confirm_cols[0].button("确认删除", key=f"watch_confirm_delete_{stock_code}"):
-                        delete_watchlist_stock(stock_code)
+                        delete_watchlist_stock(stock_code, user_id=user_id)
                         st.session_state["watchlist_delete_code"] = None
                         if st.session_state.get("watchlist_detail_code") == stock_code:
                             st.session_state["watchlist_detail_code"] = None
@@ -1878,46 +2237,51 @@ def render_watchlist_manager():
 
 
 def render_top5(top5):
-    st.subheader("今日Top5推荐")
-    header_cols = st.columns([1, 1.35, 1.15, 0.65, 0.95, 1, 0.8, 0.85, 1.25, 0.9, 0.9])
+    st.subheader(f"今日Top{len(top5)}推荐")
+    user_id = get_current_user_id()
+    sources = stock_source_map()
+    header_cols = st.columns([1, 1.35, 0.75, 1.15, 0.65, 0.95, 1, 0.8, 0.85, 1.25, 0.9, 0.9])
     header_cols[0].markdown("**股票代码**")
     header_cols[1].markdown("**股票名称**")
-    header_cols[2].markdown("**板块**")
-    header_cols[3].markdown("**评分**")
-    header_cols[4].markdown("**等级**")
-    header_cols[5].markdown("**均线状态**")
-    header_cols[6].markdown("**当前价**")
-    header_cols[7].markdown("**今日涨跌幅**")
-    header_cols[8].markdown("**近20日走势**")
-    header_cols[9].markdown("**加入自选**")
-    header_cols[10].markdown("**查看详情**")
+    header_cols[2].markdown("**来源**")
+    header_cols[3].markdown("**板块**")
+    header_cols[4].markdown("**评分**")
+    header_cols[5].markdown("**等级**")
+    header_cols[6].markdown("**均线状态**")
+    header_cols[7].markdown("**当前价**")
+    header_cols[8].markdown("**今日涨跌幅**")
+    header_cols[9].markdown("**近20日走势**")
+    header_cols[10].markdown("**加入自选**")
+    header_cols[11].markdown("**查看详情**")
 
     for _, row in top5.iterrows():
         stock_code = str(row["stock_code"]).zfill(6)
         stock_name = str(row["stock_name"])
         metadata = get_stock_metadata(stock_code)
         spark_df, current_price, pct_change, trend_return = get_price_summary(stock_code)
-        row_cols = st.columns([1, 1.35, 1.15, 0.65, 0.95, 1, 0.8, 0.85, 1.25, 0.9, 0.9])
+        row_cols = st.columns([1, 1.35, 0.75, 1.15, 0.65, 0.95, 1, 0.8, 0.85, 1.25, 0.9, 0.9])
         row_cols[0].write(stock_code)
         row_cols[1].write(stock_name)
-        row_cols[2].markdown(industry_badge_html(metadata["industry"], metadata["market_cap"]), unsafe_allow_html=True)
-        row_cols[3].write(row["score"])
-        row_cols[4].markdown(level_badge_html(row["level"]), unsafe_allow_html=True)
-        row_cols[5].markdown(ma_status_badge_html(stock_code), unsafe_allow_html=True)
-        row_cols[6].write(format_price(current_price))
-        render_pct_change(row_cols[7], pct_change)
-        render_sparkline(row_cols[8], spark_df, trend_return)
+        row_cols[2].markdown(source_badge_html(sources.get(stock_code, "扫描")), unsafe_allow_html=True)
+        row_cols[3].markdown(industry_badge_html(metadata["industry"], metadata["market_cap"]), unsafe_allow_html=True)
+        row_cols[4].write(row["score"])
+        row_cols[5].markdown(level_badge_html(row["level"]), unsafe_allow_html=True)
+        row_cols[6].markdown(ma_status_badge_html(stock_code), unsafe_allow_html=True)
+        row_cols[7].write(format_price(current_price))
+        render_pct_change(row_cols[8], pct_change)
+        render_sparkline(row_cols[9], spark_df, trend_return)
 
-        if row_cols[9].button("加入自选", key=f"top5_add_{stock_code}"):
+        if row_cols[10].button("加入自选", key=f"top5_add_{stock_code}"):
             upsert_watchlist_stock(
                 stock_code,
                 stock_name,
                 source="top5",
                 note="来自今日Top5推荐",
+                user_id=user_id,
             )
             st.success(f"{stock_code} {stock_name} 已加入自选股")
 
-        row_cols[10].button(
+        row_cols[11].button(
             "查看详情",
             key=f"top5_detail_{stock_code}",
             on_click=open_stock_detail,
@@ -1926,6 +2290,42 @@ def render_top5(top5):
 
 
 def render_candidate_pool():
+    st.subheader("动态扫描池")
+
+    dynamic_rows = list_dynamic_pool(limit=100)
+    if dynamic_rows:
+        dynamic_df = pd.DataFrame(dynamic_rows)
+        dynamic_df["stock_code"] = dynamic_df["ts_code"].astype(str).str.split(".", n=1).str[0].str.zfill(6)
+        dynamic_df["amount_yi"] = pd.to_numeric(dynamic_df["amount"], errors="coerce") / 100000
+        view = dynamic_df[[
+            "trade_date",
+            "stock_code",
+            "stock_name",
+            "close",
+            "pct_chg",
+            "amount_yi",
+            "volume_ratio",
+            "ma20",
+            "ai_score",
+            "ai_grade",
+            "filter_pass_reason",
+        ]].rename(columns={
+            "trade_date": "交易日期",
+            "stock_code": "股票代码",
+            "stock_name": "股票名称",
+            "close": "收盘价",
+            "pct_chg": "涨跌幅",
+            "amount_yi": "成交额(亿)",
+            "volume_ratio": "量比",
+            "ma20": "MA20",
+            "ai_score": "AI评分",
+            "ai_grade": "等级",
+            "filter_pass_reason": "筛选原因",
+        })
+        st.dataframe(view, use_container_width=True, hide_index=True)
+    else:
+        st.info("暂无全市场动态扫描结果，可在首页执行扫描或等待 17:30 定时任务。")
+
     st.subheader("AI每日推荐池")
 
     candidate_rows = list_latest_candidates(enabled_only=False)
@@ -2263,8 +2663,187 @@ def render_score_validation(validation_df):
         st.markdown(display_table(validation_view).to_html(escape=False, index=False), unsafe_allow_html=True)
 
 
+def render_personal_settings_page():
+    st.subheader("个人设置")
+    user_id = get_current_user_id()
+    user = current_user()
+    settings = get_current_user_settings()
+
+    st.markdown("### 账号信息")
+    account_cols = st.columns(4)
+    account_cols[0].metric("用户名", user["username"])
+    account_cols[1].metric("昵称", user["display_name"])
+    account_cols[2].metric("角色", user["role"])
+    account_cols[3].metric("最后登录", user.get("last_login_at") or "--")
+
+    with st.form("user_settings_form"):
+        st.markdown("### 策略参数")
+        score_cols = st.columns(3)
+        technical_weight = score_cols[0].number_input(
+            "技术面权重",
+            min_value=0.0,
+            max_value=1.0,
+            value=float(settings["score.technical_weight"]),
+            step=0.05,
+            format="%.2f",
+        )
+        fundamental_weight = score_cols[1].number_input(
+            "基本面权重",
+            min_value=0.0,
+            max_value=1.0,
+            value=float(settings["score.fundamental_weight"]),
+            step=0.05,
+            format="%.2f",
+        )
+        sentiment_weight = score_cols[2].number_input(
+            "情绪面权重",
+            min_value=0.0,
+            max_value=1.0,
+            value=float(settings["score.sentiment_weight"]),
+            step=0.05,
+            format="%.2f",
+        )
+
+        filter_cols = st.columns(3)
+        min_amount_yi = filter_cols[0].number_input(
+            "成交额门槛（亿元）",
+            min_value=0.1,
+            max_value=50.0,
+            value=float(settings["filter.min_amount_yi"]),
+            step=0.5,
+        )
+        volume_ratio = filter_cols[1].number_input(
+            "量比门槛",
+            min_value=0.5,
+            max_value=5.0,
+            value=float(settings["filter.volume_ratio"]),
+            step=0.1,
+        )
+        ma_condition = filter_cols[2].selectbox(
+            "均线条件",
+            ["站上MA20", "MA5>MA20", "不限制"],
+            index=["站上MA20", "MA5>MA20", "不限制"].index(settings["filter.ma_condition"])
+            if settings["filter.ma_condition"] in ["站上MA20", "MA5>MA20", "不限制"] else 0,
+        )
+
+        st.markdown("### 推荐配置")
+        rec_cols = st.columns(3)
+        top_n = rec_cols[0].selectbox(
+            "每日Top推荐数量",
+            [5, 10, 20],
+            index=[5, 10, 20].index(int(settings["recommend.top_n"]))
+            if int(settings["recommend.top_n"]) in [5, 10, 20] else 0,
+        )
+        include_avoid = rec_cols[1].checkbox(
+            "接收回避级别股票推荐",
+            value=bool(settings["recommend.include_avoid"]),
+        )
+        enable_market_scan = rec_cols[2].checkbox(
+            "开启全市场扫描",
+            value=bool(settings["recommend.enable_market_scan"]),
+        )
+
+        st.markdown("### 通知设置")
+        notify_cols = st.columns(2)
+        email_enabled = notify_cols[0].checkbox(
+            "邮件通知",
+            value=bool(settings["notify.email_enabled"]),
+        )
+        score_change_threshold = notify_cols[1].number_input(
+            "评分变化通知阈值",
+            min_value=1,
+            max_value=100,
+            value=int(settings["notify.score_change_threshold"]),
+            step=1,
+        )
+
+        action_cols = st.columns([1, 1, 4])
+        submitted = action_cols[0].form_submit_button("保存设置")
+        reset = action_cols[1].form_submit_button("恢复默认")
+
+    if submitted:
+        if technical_weight + fundamental_weight + sentiment_weight <= 0:
+            st.error("三个评分权重之和必须大于 0")
+            return
+        save_user_settings(user_id, {
+            "score.technical_weight": technical_weight,
+            "score.fundamental_weight": fundamental_weight,
+            "score.sentiment_weight": sentiment_weight,
+            "filter.min_amount_yi": min_amount_yi,
+            "filter.volume_ratio": volume_ratio,
+            "filter.ma_condition": ma_condition,
+            "recommend.top_n": top_n,
+            "recommend.include_avoid": include_avoid,
+            "recommend.enable_market_scan": enable_market_scan,
+            "notify.email_enabled": email_enabled,
+            "notify.score_change_threshold": score_change_threshold,
+        })
+        st.success("个人设置已保存，下次评分和扫描会使用新参数")
+        st.rerun()
+
+    if reset:
+        reset_user_settings(user_id)
+        st.success("已恢复默认设置")
+        st.rerun()
+
+
+def render_system_management_page():
+    st.subheader("系统管理")
+    user = current_user()
+    if not user or user.get("role") != "admin":
+        st.warning("只有管理员可以访问系统管理")
+        return
+
+    st.markdown("### 注册用户")
+    users_df = pd.DataFrame(list_users())
+    if not users_df.empty:
+        st.dataframe(
+            users_df[["id", "username", "display_name", "email", "role", "is_active", "created_at", "last_login_at"]],
+            use_container_width=True,
+            hide_index=True,
+        )
+        with st.form("toggle_user_active_form"):
+            user_options = [
+                f"{row['id']} {row['username']} ({'启用' if int(row['is_active']) else '禁用'})"
+                for _, row in users_df.iterrows()
+                if int(row["id"]) != get_current_user_id()
+            ]
+            selected = st.selectbox("选择用户", user_options)
+            target_active = st.radio("账号状态", ["启用", "禁用"], horizontal=True)
+            submitted = st.form_submit_button("更新账号状态")
+            if submitted and selected:
+                target_user_id = int(selected.split(" ", 1)[0])
+                set_user_active(target_user_id, 1 if target_active == "启用" else 0)
+                st.success("账号状态已更新")
+                st.rerun()
+
+    st.markdown("### 系统运行状态")
+    scan_summary = get_latest_dynamic_pool_summary()
+    status_cols = st.columns(4)
+    if scan_summary:
+        status_cols[0].metric("最近扫描日期", scan_summary.get("trade_date", "--"))
+        status_cols[1].metric("扫描股票数", scan_summary.get("scanned_count", "--"))
+        status_cols[2].metric("入选数量", scan_summary.get("selected_count", "--"))
+        status_cols[3].metric("完成时间", scan_summary.get("completed_at", "--"))
+    else:
+        status_cols[0].metric("最近扫描日期", "--")
+        status_cols[1].metric("扫描股票数", "--")
+        status_cols[2].metric("入选数量", "--")
+        status_cols[3].metric("完成时间", "--")
+    st.caption("API调用次数暂未持久化统计，后续接入接口计数表后展示。")
+
+    if st.button("手动触发全市场扫描", key="admin_run_market_scan"):
+        with st.spinner("正在执行全市场扫描..."):
+            result = run_dynamic_pool_scan()
+        if result.get("ok"):
+            st.success(result.get("message", "扫描完成"))
+        else:
+            st.info(result.get("message", "扫描已跳过"))
+
+
 def render_backtest_page(stock_code):
     st.subheader("策略回测")
+    user_id = get_current_user_id()
 
     price_df = load_backtest_price_data(stock_code)
     if price_df.empty:
@@ -2318,6 +2897,20 @@ def render_backtest_page(stock_code):
         initial_cash=float(initial_cash),
         commission=float(commission),
         slippage=float(slippage),
+    )
+    save_backtest_result(
+        user_id,
+        stock_code,
+        params={
+            "start_date": start_date,
+            "end_date": end_date,
+            "short_window": int(short_window),
+            "long_window": int(long_window),
+            "initial_cash": float(initial_cash),
+            "commission": float(commission),
+            "slippage": float(slippage),
+        },
+        metrics=metrics,
     )
 
     metric_cols = st.columns(5)
@@ -2390,12 +2983,32 @@ def render_backtest_page(stock_code):
         })
         st.dataframe(trade_view, use_container_width=True, hide_index=True)
 
+    recent_results = list_backtest_results(user_id, stock_code=stock_code, limit=10)
+    if recent_results:
+        st.markdown("### 我的最近回测")
+        recent_view = []
+        for item in recent_results:
+            params = item.get("params", {})
+            item_metrics = item.get("metrics", {})
+            recent_view.append({
+                "运行时间": item.get("created_at"),
+                "区间": f"{params.get('start_date', '')} ~ {params.get('end_date', '')}",
+                "均线": f"{params.get('short_window', '')}/{params.get('long_window', '')}",
+                "策略收益": item_metrics.get("策略累计收益率"),
+                "最大回撤": item_metrics.get("最大回撤"),
+                "交易次数": item_metrics.get("交易次数"),
+            })
+        st.dataframe(pd.DataFrame(recent_view), use_container_width=True, hide_index=True)
+
 
 def select_stock_in_sidebar(pool):
     options = [
         f"{item['code']} {item['name']}"
         for item in pool
     ] or STOCK_OPTIONS
+    if not options:
+        st.sidebar.info("当前没有可分析股票")
+        return None
     default_option = next(
         (option for option in options if option.startswith("600519 ")),
         options[0],
@@ -2421,19 +3034,51 @@ def select_stock_in_sidebar(pool):
 
 st.set_page_config(page_title="AI量化交易系统", layout="wide")
 apply_theme()
+current_user_info = require_authentication()
+STOCK_POOL = get_stock_pool(user_id=get_current_user_id())
+initial_settings = get_current_user_settings()
+if not initial_settings["recommend.enable_market_scan"]:
+    STOCK_POOL = [item for item in STOCK_POOL if item.get("source") != "扫描"]
+STOCK_NAMES = {
+    item["code"]: item["name"]
+    for item in STOCK_POOL
+}
+STOCK_METADATA = {
+    item["code"]: {
+        "industry": item.get("industry", "未分类"),
+        "market_cap": item.get("market_cap", "未分类"),
+    }
+    for item in STOCK_POOL
+}
+STOCK_OPTIONS = [
+    f"{item['code']} {item['name']}"
+    for item in STOCK_POOL
+]
+render_user_header(current_user_info)
 
 st.sidebar.title("导航")
+nav_options = ["首页总览", "股票分析", "推荐池", "历史回测", "个人设置"]
+if current_user_info.get("role") == "admin":
+    nav_options.append("系统管理")
 page = st.sidebar.radio(
     "选择功能",
-    ["首页总览", "股票分析", "推荐池", "历史回测"],
+    nav_options,
     key="page",
 )
 selected_industries, selected_market_caps = render_pool_filters()
 st.session_state["selected_industries"] = selected_industries
 st.session_state["selected_market_caps"] = selected_market_caps
 filtered_stock_pool = filter_stock_pool(STOCK_POOL)
+settings = get_current_user_settings()
 
 st.title("AI量化交易系统")
+
+if page == "个人设置":
+    render_personal_settings_page()
+    st.stop()
+if page == "系统管理":
+    render_system_management_page()
+    st.stop()
 
 df, validation_df = load_score_data()
 
@@ -2443,6 +3088,8 @@ if df.empty:
 
 df = prepare_score_data(df)
 df = apply_score_filters(df, filtered_stock_pool)
+if not settings["recommend.include_avoid"]:
+    df = df[df["level"] != "回避"].copy()
 
 if df.empty:
     st.warning("当前筛选条件下暂无评分数据")
@@ -2450,22 +3097,29 @@ if df.empty:
         render_stock_pool_overview(STOCK_POOL)
     st.stop()
 
-top5 = df.head(5)
+top5 = df.head(int(settings["recommend.top_n"]))
 
 if page in ["股票分析", "历史回测"]:
     stock_code = select_stock_in_sidebar(filtered_stock_pool)
 
 if page == "首页总览":
     render_metrics(df)
+    render_market_scan_card()
     render_news_sentiment_controls()
     render_stock_pool_overview(STOCK_POOL)
     render_top5(top5)
     render_watchlist_manager()
 elif page == "股票分析":
-    render_stock_detail_page(stock_code)
+    if stock_code:
+        render_stock_detail_page(stock_code)
+    else:
+        st.info("当前没有股票可分析，请先加入自选股或开启全市场扫描。")
 elif page == "推荐池":
     render_top5(top5)
     render_candidate_pool()
 elif page == "历史回测":
-    render_backtest_page(stock_code)
-    render_score_validation(validation_df)
+    if stock_code:
+        render_backtest_page(stock_code)
+        render_score_validation(validation_df)
+    else:
+        st.info("当前没有股票可回测，请先加入自选股或开启全市场扫描。")
